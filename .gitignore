@@ -1,0 +1,7 @@
+env/
+__pycache__/
+*.pyc
+sender
+receiver
+playout_log.json
+relay_stats.json

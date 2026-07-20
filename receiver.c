@@ -39,7 +39,20 @@ static double now_s(void) {
     return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-/* Read all currently-available packets into the buffer; never blocks. */
+/* Store a decoded frame (harness format: seq32 + payload) into its slot. */
+static void store(uint32_t seq, const uint8_t *frame, int n_frames) {
+    if (seq < (uint32_t)n_frames && !slots[seq].present) {
+        memcpy(slots[seq].data, frame, FRAME_LEN);
+        slots[seq].present = 1;
+    }
+}
+
+/* Read all currently-available packets into the buffer; never blocks.
+ *
+ * Wire format from sender:
+ *   DATA   : [0x00][seq:4 BE][payload:160]
+ *   PARITY : [0x01][base:4 BE][k:1][stride:1][xor_payload:160]  (Step 4)
+ */
 static void drain(int fd, int n_frames) {
     for (;;) {
         struct timeval zero = {0, 0};
@@ -48,14 +61,15 @@ static void drain(int fd, int n_frames) {
 
         uint8_t pkt[2048];
         ssize_t n = recvfrom(fd, pkt, sizeof pkt, 0, NULL, NULL);
-        if (n < FRAME_LEN) continue;
+        if (n < 1) continue;
 
-        uint32_t seq = (uint32_t)pkt[0] << 24 | (uint32_t)pkt[1] << 16
-                     | (uint32_t)pkt[2] <<  8 | (uint32_t)pkt[3];
-        if (seq < (uint32_t)n_frames && !slots[seq].present) {
-            memcpy(slots[seq].data, pkt, FRAME_LEN);
-            slots[seq].present = 1;
+        if (pkt[0] == 0x00 && n >= 1 + FRAME_LEN) {
+            /* DATA: bytes after the type byte are the harness frame verbatim */
+            uint32_t seq = (uint32_t)pkt[1] << 24 | (uint32_t)pkt[2] << 16
+                         | (uint32_t)pkt[3] <<  8 | (uint32_t)pkt[4];
+            store(seq, pkt + 1, n_frames);
         }
+        /* PARITY (0x01) handled in Step 4 — ignored for now. */
     }
 }
 

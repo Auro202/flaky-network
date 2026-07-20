@@ -1,23 +1,34 @@
-/* SENDER — forwards each frame once, plus interleaved XOR parity (FEC).
+/* SENDER — forwards each frame once, plus TWO layers of XOR parity (FEC).
  *
  * Ports:
  *   bind 47010  <- harness source, frame i at t0 + i*20ms (seq32 + 160 payload)
  *   send 47001  -> relay uplink toward receiver (MY wire format below)
  *
  * Wire format (sender -> receiver):
- *   DATA   : [0x00][seq:4 BE][payload:160]                    = 165 bytes
- *   PARITY : [0x01][base:4 BE][k:1][stride:1][xor_payload:160] = 167 bytes
+ *   DATA   : [0x00][seq:4 BE][payload:160]                            = 165 B
+ *   PARITY : [0x01][base:4 BE][k:1][layer:1][off:1][xor_payload:160] = 168 B
  *
- * FEC scheme — interleaved XOR parity:
- *   K      = frames per parity group  -> overhead ~ 1 + 1/K
- *   STRIDE = interleave depth. A group's K members are STRIDE apart, so a
- *            burst of up to STRIDE consecutive losses lands in distinct
- *            groups (each loses at most one frame = recoverable).
- *   Parity for a group is XOR of its K payloads, emitted the instant the
- *   group's last frame arrives.
+ * FEC scheme — two overlapping XOR parity layers.
+ *   A layer with group size K covers disjoint runs of K consecutive frames,
+ *   starting at `offset`. Its parity is the XOR of those K payloads, emitted
+ *   the instant the group's last frame arrives. Any ONE lost frame in a
+ *   group is recoverable as parity XOR the survivors.
  *
- * Grouping: within each block of K*STRIDE consecutive frames, group j
- * (0 <= j < STRIDE) owns members {block + j + m*STRIDE : 0 <= m < K}.
+ *   Two layers with different K and offset put every frame in two DIFFERENT
+ *   groups, so a frame survives unless BOTH of its groups are unrecoverable.
+ *   With one layer the residual miss rate is
+ *       P(lost) * [1 - P(partner ok)*P(parity ok)]
+ *   which on a 5% loss link is ~0.5% — right at the 1% cap. A second,
+ *   independent layer squares the failure term and drops it to ~0.1%.
+ *
+ * Timing constraint (this is what sets K):
+ *   A group's parity cannot be computed until its LAST frame arrives, so
+ *   parity lags the group's EARLIEST frame by (K-1)*20ms. That parity is
+ *   only useful if it still beats that frame's deadline. Hence small K:
+ *   K=2 lags 20ms, K=3 lags 40ms, K=4 would lag 60ms and arrive too late
+ *   to rescue the head of each group on a high-jitter link.
+ *
+ * Budget: 165*1500 data + 168*(750+500) parity = 1.91x, under the 2.0x cap.
  */
 #include <arpa/inet.h>
 #include <stdint.h>
@@ -30,16 +41,19 @@
 #define PAYLOAD_LEN 160
 #define HARNESS_LEN (4 + PAYLOAD_LEN)   /* seq32 + payload from source */
 
-/* FEC parameters. Defaults below; override via env for tuning sweeps:
- *   FEC_K      frames per parity group   (overhead ~ 1 + 1/K)
- *   FEC_STRIDE interleave depth          (burst tolerance)
- * Note: parity for a group cannot be computed until its LAST frame arrives,
- * so the group span (K-1)*STRIDE frames directly delays parity relative to
- * the group's earliest frame. Large K or STRIDE trades timing for coverage. */
-#define DEFAULT_K       2
-#define DEFAULT_STRIDE  1
+#define NUM_LAYERS 2
 
-#define MAX_STRIDE 64
+/* Per-layer FEC geometry: group size and starting offset. Offsets differ so
+ * the two layers' group boundaries never line up, giving each frame two
+ * independent recovery chances. Override K via env for tuning sweeps. */
+#define DEFAULT_K0  2
+#define DEFAULT_K1  3
+
+typedef struct {
+    int     k;
+    int     offset;
+    uint8_t acc[PAYLOAD_LEN];   /* running XOR of the current group */
+} Layer;
 
 static int env_int(const char *name, int fallback) {
     const char *v = getenv(name);
@@ -49,9 +63,10 @@ static int env_int(const char *name, int fallback) {
 }
 
 int main(void) {
-    const int K      = env_int("FEC_K", DEFAULT_K);
-    int       STRIDE = env_int("FEC_STRIDE", DEFAULT_STRIDE);
-    if (STRIDE > MAX_STRIDE) STRIDE = MAX_STRIDE;
+    Layer layers[NUM_LAYERS] = {
+        { env_int("FEC_K0", DEFAULT_K0), 0, {0} },
+        { env_int("FEC_K1", DEFAULT_K1), 1, {0} },
+    };
 
     int in_fd = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in in_addr = {0};
@@ -68,14 +83,7 @@ int main(void) {
     relay.sin_port        = htons(47001);
     relay.sin_addr.s_addr = inet_addr("127.0.0.1");
 
-    /* One XOR accumulator per group within the current block. */
-    static uint8_t acc[MAX_STRIDE][PAYLOAD_LEN];
-    memset(acc, 0, sizeof acc);
-
-    const int block = K * STRIDE;
-
-    uint8_t in[2048];
-    uint8_t out[2048];
+    uint8_t in[2048], out[2048];
 
     for (;;) {
         ssize_t n = recvfrom(in_fd, in, sizeof in, 0, NULL, NULL);
@@ -85,35 +93,38 @@ int main(void) {
                      | (uint32_t)in[2] <<  8 | (uint32_t)in[3];
         const uint8_t *payload = in + 4;
 
-        /* Forward the data packet immediately. */
+        /* Forward the data packet immediately — never delay real media. */
         out[0] = 0x00;
         memcpy(out + 1, in, HARNESS_LEN);   /* seq32 + payload, verbatim */
         sendto(out_fd, out, 1 + HARNESS_LEN, 0,
                (struct sockaddr *)&relay, sizeof relay);
 
-        /* Fold into this frame's parity group. */
-        int within = (int)(seq % (uint32_t)block);
-        int group  = within % STRIDE;   /* 0..STRIDE-1 */
-        int member = within / STRIDE;   /* 0..K-1     */
+        /* Fold the payload into each layer's current group. */
+        for (int L = 0; L < NUM_LAYERS; L++) {
+            Layer *ly = &layers[L];
+            if (seq < (uint32_t)ly->offset) continue;   /* layer not started */
 
-        for (int b = 0; b < PAYLOAD_LEN; b++)
-            acc[group][b] ^= payload[b];
+            for (int b = 0; b < PAYLOAD_LEN; b++)
+                ly->acc[b] ^= payload[b];
 
-        /* Last member of the group just arrived — emit its parity. */
-        if (member == K - 1) {
-            uint32_t base = seq - (uint32_t)((K - 1) * STRIDE);  /* first seq */
+            /* Group closes on its last member; emit parity and reset. */
+            int member = (int)((seq - (uint32_t)ly->offset) % (uint32_t)ly->k);
+            if (member != ly->k - 1) continue;
+
+            uint32_t base = seq - (uint32_t)(ly->k - 1);
             out[0] = 0x01;
             out[1] = (uint8_t)(base >> 24);
             out[2] = (uint8_t)(base >> 16);
             out[3] = (uint8_t)(base >>  8);
             out[4] = (uint8_t)(base);
-            out[5] = (uint8_t)K;
-            out[6] = (uint8_t)STRIDE;
-            memcpy(out + 7, acc[group], PAYLOAD_LEN);
-            sendto(out_fd, out, 7 + PAYLOAD_LEN, 0,
+            out[5] = (uint8_t)ly->k;
+            out[6] = (uint8_t)L;
+            out[7] = (uint8_t)ly->offset;
+            memcpy(out + 8, ly->acc, PAYLOAD_LEN);
+            sendto(out_fd, out, 8 + PAYLOAD_LEN, 0,
                    (struct sockaddr *)&relay, sizeof relay);
 
-            memset(acc[group], 0, PAYLOAD_LEN);   /* reset for next block */
+            memset(ly->acc, 0, PAYLOAD_LEN);
         }
     }
     return 0;

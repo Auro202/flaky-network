@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Flaky Network — Summary</title>
+<style>
+  :root{
+    --bg:#ffffff; --fg:#14161a; --muted:#5c6370; --line:#e3e6ea;
+    --card:#f7f8fa; --ok:#0a7d44; --bad:#c0392b; --accent:#2d5bd7;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{ --bg:#0f1115; --fg:#e6e8ec; --muted:#9aa3af; --line:#262b33;
+           --card:#161a20; --ok:#3ddc84; --bad:#ff6b5e; --accent:#7aa2ff; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:2.5rem 1.25rem;background:var(--bg);color:var(--fg);
+       font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  main{max-width:60rem;margin:0 auto}
+  h1{font-size:1.9rem;margin:0 0 .25rem;letter-spacing:-.02em}
+  .sub{color:var(--muted);margin:0 0 2rem}
+  h2{font-size:1.15rem;margin:2.5rem 0 .75rem;padding-bottom:.4rem;
+     border-bottom:1px solid var(--line)}
+  .grid{display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(11rem,1fr));margin:1.5rem 0}
+  .stat{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:1rem}
+  .stat .k{font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+  .stat .v{font-size:1.65rem;font-weight:650;margin-top:.2rem;letter-spacing:-.02em}
+  .ok{color:var(--ok)} .bad{color:var(--bad)}
+  .scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  table{border-collapse:collapse;width:100%;min-width:34rem;font-size:.92rem}
+  th,td{text-align:left;padding:.55rem .7rem;border-bottom:1px solid var(--line)}
+  th{font-size:.74rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:600}
+  td.num{font-variant-numeric:tabular-nums}
+  code{background:var(--card);border:1px solid var(--line);border-radius:4px;
+       padding:.1rem .35rem;font-size:.87em}
+  .note{border-left:3px solid var(--accent);background:var(--card);
+        padding:.85rem 1rem;border-radius:0 8px 8px 0;margin:1rem 0}
+  .note b{color:var(--accent)}
+  ul{padding-left:1.15rem} li{margin:.35rem 0}
+  footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--line);
+         color:var(--muted);font-size:.85rem}
+</style>
+</head>
+<body>
+<main>
+
+  <h1>The Flaky Network</h1>
+  <p class="sub">Low-delay media playout over a lossy, jittery, reordering UDP relay.</p>
+
+  <div class="grid">
+    <div class="stat"><div class="k">Graded delay</div><div class="v">100 ms</div></div>
+    <div class="stat"><div class="k">Profile A misses</div><div class="v ok">0.00 %</div></div>
+    <div class="stat"><div class="k">Profile B misses</div><div class="v ok">0.27 %</div></div>
+    <div class="stat"><div class="k">Overhead</div><div class="v">1.91×</div></div>
+  </div>
+
+  <h2>Result</h2>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Profile</th><th>Frames</th><th>Misses</th><th>Overhead</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>A — 2 % loss, 10–40 ms</td><td class="num">1500</td><td class="num">0 (0.00 %)</td><td class="num">1.91×</td><td class="ok">VALID</td></tr>
+      <tr><td>B — 5 % loss, 20–80 ms</td><td class="num">1500</td><td class="num">4 (0.27 %)</td><td class="num">1.91×</td><td class="ok">VALID</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Caps: misses ≤ 1.00 %, overhead ≤ 2.00×. No feedback channel is used, so all
+     bytes are uplink.</p>
+
+  <h2>Diagnosis</h2>
+  <p>The baseline missed 340 frames while the relay dropped only 34 — so roughly
+     <b>306 misses were frames that arrived late, not lost</b>. Two distinct
+     problems, addressed by two distinct mechanisms.</p>
+
+  <h2>Design</h2>
+  <ul>
+    <li><b>FEC, not retransmission.</b> A resend costs two crossings of the hostile
+        link and inflates the very quantity being scored. Redundancy sent ahead of
+        time costs bytes instead of delay, and the byte budget was the slack resource.</li>
+    <li><b>Two overlapping XOR parity layers</b> — layer 0 (K=2, offset 0) and
+        layer 1 (K=3, offset 1). Every frame belongs to two different groups, so it
+        survives unless both are unrecoverable.</li>
+    <li><b>No output pacing.</b> Frames are forwarded the instant they exist.</li>
+  </ul>
+
+  <div class="note">
+    <b>Key finding — parity lag sets K.</b> A group's parity cannot be computed
+    until its <i>last</i> frame arrives, so it lags the group's <i>earliest</i>
+    frame by (K−1)×20 ms. Rescuing that frame requires
+    <code>(K−1)·20 + net_delay &lt; delay_ms</code>. On profile B that holds only
+    ~⅓ of the time at K=4 — which is why K=4 recovered just half the drops, while
+    K=2 (20 ms lag) recovered nearly all.
+  </div>
+
+  <div class="note">
+    <b>Key finding — pacing was harmful.</b> The harness scores each frame's
+    <i>first</i> arrival against a deadline that is a latest bound, not a schedule.
+    Delivering early is never penalised, and the receiver→player leg bypasses the
+    relay, so it costs nothing. Holding a frame already in hand could only lose
+    races against scheduler wakeup jitter. Removing the playout clock took profile
+    A's floor from 100 ms to 60 ms.
+  </div>
+
+  <h2>Why 100 ms, not 60 ms</h2>
+  <p>Profile A is valid at 60 ms, but one <code>delay_ms</code> must hold on unseen
+     grading profiles. Beyond ~100 ms, extra delay cannot help B at all: its jitter
+     maxes at 80 ms, so every non-lost frame already arrives in time and the residual
+     is pure unrecoverable loss. That is precisely why the final improvement was a
+     second parity layer rather than a larger buffer — it cut B from 1.00 % (exactly
+     on the cap) to 0.27 %.</p>
+
+  <h2>Known limitation</h2>
+  <p>Both layers group consecutive frames, so a loss burst long enough to take two
+     members of the same group defeats recovery. Interleaving support
+     (<code>STRIDE</code>) is implemented but left at 1: spreading a group over more
+     frames widens its span and reintroduces the same parity-lag problem that made
+     K=4 fail.</p>
+
+  <footer>
+    Sender and receiver in C. Measurements from <code>run.py</code>, 30 s / 1500 frames
+    per run. Full experiment history in <code>RUNLOG.md</code>.
+  </footer>
+
+</main>
+</body>
+</html>

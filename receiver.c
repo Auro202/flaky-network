@@ -33,6 +33,14 @@ typedef struct {
 
 static Slot slots[MAX_FRAMES];
 
+/* Parity store, indexed by the group's base seq. Each parity is the XOR of
+ * the K payloads at { base + m*stride : 0 <= m < K }. */
+static uint8_t parity_payload[MAX_FRAMES][PAYLOAD_LEN];
+static int     parity_present[MAX_FRAMES];
+
+/* FEC params are learned from the first parity packet (sender-chosen). */
+static int learned_k = 0, learned_stride = 0;
+
 static double now_s(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -47,11 +55,60 @@ static void store(uint32_t seq, const uint8_t *frame, int n_frames) {
     }
 }
 
+/* Base seq of the parity group that owns `seq`, given the FEC geometry.
+ * Frames are laid out in blocks of K*STRIDE; group j within a block owns
+ * members { block + j + m*STRIDE : 0 <= m < K }. */
+static uint32_t group_base(uint32_t seq, int k, int stride) {
+    uint32_t block_len = (uint32_t)(k * stride);
+    uint32_t block     = (seq / block_len) * block_len;
+    uint32_t j         = (seq % block_len) % (uint32_t)stride;
+    return block + j;
+}
+
+/* If this group has its parity and exactly one missing data frame, rebuild
+ * the missing frame as parity XOR (all surviving members). */
+static void try_reconstruct(uint32_t base, int n_frames) {
+    if (base >= (uint32_t)n_frames || !parity_present[base]) return;
+    if (learned_k <= 0) return;
+
+    int      n_missing   = 0;
+    uint32_t missing_seq = 0;
+
+    for (int m = 0; m < learned_k; m++) {
+        uint32_t s = base + (uint32_t)(m * learned_stride);
+        if (s >= (uint32_t)n_frames) continue;   /* group truncated at stream end */
+        if (!slots[s].present) {
+            n_missing++;
+            missing_seq = s;
+            if (n_missing > 1) return;           /* unrecoverable: 2+ gone */
+        }
+    }
+    if (n_missing != 1) return;                  /* nothing to do */
+
+    /* missing payload = parity XOR every surviving member's payload */
+    uint8_t rebuilt[FRAME_LEN];
+    rebuilt[0] = (uint8_t)(missing_seq >> 24);
+    rebuilt[1] = (uint8_t)(missing_seq >> 16);
+    rebuilt[2] = (uint8_t)(missing_seq >>  8);
+    rebuilt[3] = (uint8_t)(missing_seq);
+    memcpy(rebuilt + 4, parity_payload[base], PAYLOAD_LEN);
+
+    for (int m = 0; m < learned_k; m++) {
+        uint32_t s = base + (uint32_t)(m * learned_stride);
+        if (s >= (uint32_t)n_frames || s == missing_seq) continue;
+        const uint8_t *p = slots[s].data + 4;
+        for (int b = 0; b < PAYLOAD_LEN; b++) rebuilt[4 + b] ^= p[b];
+    }
+
+    memcpy(slots[missing_seq].data, rebuilt, FRAME_LEN);
+    slots[missing_seq].present = 1;
+}
+
 /* Read all currently-available packets into the buffer; never blocks.
  *
  * Wire format from sender:
  *   DATA   : [0x00][seq:4 BE][payload:160]
- *   PARITY : [0x01][base:4 BE][k:1][stride:1][xor_payload:160]  (Step 4)
+ *   PARITY : [0x01][base:4 BE][k:1][stride:1][xor_payload:160]
  */
 static void drain(int fd, int n_frames) {
     for (;;) {
@@ -68,8 +125,29 @@ static void drain(int fd, int n_frames) {
             uint32_t seq = (uint32_t)pkt[1] << 24 | (uint32_t)pkt[2] << 16
                          | (uint32_t)pkt[3] <<  8 | (uint32_t)pkt[4];
             store(seq, pkt + 1, n_frames);
+
+            /* A late member can be the one that leaves its group with a
+             * single hole — retry that group. */
+            if (learned_k > 0 && seq < (uint32_t)n_frames)
+                try_reconstruct(group_base(seq, learned_k, learned_stride),
+                                n_frames);
+
+        } else if (pkt[0] == 0x01 && n >= 7 + PAYLOAD_LEN) {
+            uint32_t base = (uint32_t)pkt[1] << 24 | (uint32_t)pkt[2] << 16
+                          | (uint32_t)pkt[3] <<  8 | (uint32_t)pkt[4];
+            int k      = pkt[5];
+            int stride = pkt[6];
+            if (k <= 0 || stride <= 0) continue;
+
+            learned_k      = k;
+            learned_stride = stride;
+
+            if (base < (uint32_t)n_frames && !parity_present[base]) {
+                memcpy(parity_payload[base], pkt + 7, PAYLOAD_LEN);
+                parity_present[base] = 1;
+            }
+            try_reconstruct(base, n_frames);
         }
-        /* PARITY (0x01) handled in Step 4 — ignored for now. */
     }
 }
 

@@ -31,7 +31,7 @@
 #define HARNESS_LEN (4 + PAYLOAD_LEN)   /* seq32 + payload from source */
 
 /* FEC parameters — tuned in Step 5. */
-#define K       4      /* frames per parity group */
+#define K       2      /* frames per parity group */
 #define STRIDE  1      /* interleave depth (burst tolerance) */
 
 #define MAX_STRIDE 64

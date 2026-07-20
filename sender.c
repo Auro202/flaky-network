@@ -30,13 +30,29 @@
 #define PAYLOAD_LEN 160
 #define HARNESS_LEN (4 + PAYLOAD_LEN)   /* seq32 + payload from source */
 
-/* FEC parameters — tuned in Step 5. */
-#define K       2      /* frames per parity group */
-#define STRIDE  1      /* interleave depth (burst tolerance) */
+/* FEC parameters. Defaults below; override via env for tuning sweeps:
+ *   FEC_K      frames per parity group   (overhead ~ 1 + 1/K)
+ *   FEC_STRIDE interleave depth          (burst tolerance)
+ * Note: parity for a group cannot be computed until its LAST frame arrives,
+ * so the group span (K-1)*STRIDE frames directly delays parity relative to
+ * the group's earliest frame. Large K or STRIDE trades timing for coverage. */
+#define DEFAULT_K       2
+#define DEFAULT_STRIDE  1
 
 #define MAX_STRIDE 64
 
+static int env_int(const char *name, int fallback) {
+    const char *v = getenv(name);
+    if (!v || !*v) return fallback;
+    int n = atoi(v);
+    return n > 0 ? n : fallback;
+}
+
 int main(void) {
+    const int K      = env_int("FEC_K", DEFAULT_K);
+    int       STRIDE = env_int("FEC_STRIDE", DEFAULT_STRIDE);
+    if (STRIDE > MAX_STRIDE) STRIDE = MAX_STRIDE;
+
     int in_fd = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in in_addr = {0};
     in_addr.sin_family      = AF_INET;
@@ -53,7 +69,7 @@ int main(void) {
     relay.sin_addr.s_addr = inet_addr("127.0.0.1");
 
     /* One XOR accumulator per group within the current block. */
-    uint8_t acc[MAX_STRIDE][PAYLOAD_LEN];
+    static uint8_t acc[MAX_STRIDE][PAYLOAD_LEN];
     memset(acc, 0, sizeof acc);
 
     const int block = K * STRIDE;

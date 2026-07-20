@@ -1,14 +1,22 @@
-/* RECEIVER — jitter buffer, single-threaded, select()-driven playout clock.
+/* RECEIVER — reorder/dedup buffer + XOR FEC recovery, zero-latency output.
  *
  * Ports:
  *   bind 47002  <- media from sender via relay
  *   send 47020  -> harness player (4-byte big-endian seq + 160-byte payload)
  *
- * Design: drain all pending packets non-blocking, then sleep with ONE
- * blocking select() call until the playout deadline, then drain again and
- * send. Sending 10 ms before the harness deadline absorbs OS scheduling
- * jitter (relay max jitter is 40/80 ms; 10 ms headroom still leaves ≥10 ms
- * for late packets to arrive in the buffer).
+ * Design: the harness player records each frame's FIRST arrival and checks
+ * it against a deadline — that is a LATEST bound, not a schedule. Delivering
+ * a frame early is never penalised, and the receiver->player leg does not
+ * cross the relay, so it costs nothing against the overhead cap.
+ *
+ * Therefore we do NOT pace output. Every frame is forwarded the instant it
+ * exists: on arrival, or the moment FEC reconstructs it. An earlier version
+ * paced sends to just before each deadline and lost frames whenever the OS
+ * scheduler woke us late — pure downside, since holding a frame we already
+ * have can only reduce its chance of beating the deadline.
+ *
+ * The buffer's only remaining job is to retain payloads for XOR recovery
+ * and to suppress duplicate forwards.
  */
 #include <arpa/inet.h>
 #include <stdint.h>
@@ -24,7 +32,6 @@
 #define PAYLOAD_LEN 160
 #define FRAME_LEN   (4 + PAYLOAD_LEN)
 #define FRAME_MS    20
-#define SEND_EARLY_MS 10.0   /* send this many ms before harness deadline */
 
 typedef struct {
     uint8_t data[FRAME_LEN];
@@ -32,6 +39,10 @@ typedef struct {
 } Slot;
 
 static Slot slots[MAX_FRAMES];
+
+/* Player socket + address: frames are emitted the moment they materialise. */
+static int                g_out_fd;
+static struct sockaddr_in g_player;
 
 /* Parity store, indexed by the group's base seq. Each parity is the XOR of
  * the K payloads at { base + m*stride : 0 <= m < K }. */
@@ -41,18 +52,17 @@ static int     parity_present[MAX_FRAMES];
 /* FEC params are learned from the first parity packet (sender-chosen). */
 static int learned_k = 0, learned_stride = 0;
 
-static double now_s(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
-}
-
-/* Store a decoded frame (harness format: seq32 + payload) into its slot. */
+/* Record a frame (harness format: seq32 + payload) and forward it to the
+ * player immediately. `present` doubles as the dedup flag: the player keeps
+ * only a frame's first arrival, so re-sending a known frame is pure waste. */
 static void store(uint32_t seq, const uint8_t *frame, int n_frames) {
-    if (seq < (uint32_t)n_frames && !slots[seq].present) {
-        memcpy(slots[seq].data, frame, FRAME_LEN);
-        slots[seq].present = 1;
-    }
+    if (seq >= (uint32_t)n_frames || slots[seq].present) return;
+
+    memcpy(slots[seq].data, frame, FRAME_LEN);
+    slots[seq].present = 1;
+
+    sendto(g_out_fd, slots[seq].data, FRAME_LEN, 0,
+           (struct sockaddr *)&g_player, sizeof g_player);
 }
 
 /* Base seq of the parity group that owns `seq`, given the FEC geometry.
@@ -100,25 +110,18 @@ static void try_reconstruct(uint32_t base, int n_frames) {
         for (int b = 0; b < PAYLOAD_LEN; b++) rebuilt[4 + b] ^= p[b];
     }
 
-    memcpy(slots[missing_seq].data, rebuilt, FRAME_LEN);
-    slots[missing_seq].present = 1;
+    /* store() forwards the recovered frame to the player right away. */
+    store(missing_seq, rebuilt, n_frames);
 }
 
-/* Read all currently-available packets into the buffer; never blocks.
+/* Process one packet from the relay.
  *
  * Wire format from sender:
  *   DATA   : [0x00][seq:4 BE][payload:160]
  *   PARITY : [0x01][base:4 BE][k:1][stride:1][xor_payload:160]
  */
-static void drain(int fd, int n_frames) {
-    for (;;) {
-        struct timeval zero = {0, 0};
-        fd_set fds; FD_ZERO(&fds); FD_SET(fd, &fds);
-        if (select(fd + 1, &fds, NULL, NULL, &zero) <= 0) break;
-
-        uint8_t pkt[2048];
-        ssize_t n = recvfrom(fd, pkt, sizeof pkt, 0, NULL, NULL);
-        if (n < 1) continue;
+static void handle(const uint8_t *pkt, ssize_t n, int n_frames) {
+        if (n < 1) return;
 
         if (pkt[0] == 0x00 && n >= 1 + FRAME_LEN) {
             /* DATA: bytes after the type byte are the harness frame verbatim */
@@ -137,7 +140,7 @@ static void drain(int fd, int n_frames) {
                           | (uint32_t)pkt[3] <<  8 | (uint32_t)pkt[4];
             int k      = pkt[5];
             int stride = pkt[6];
-            if (k <= 0 || stride <= 0) continue;
+            if (k <= 0 || stride <= 0) return;
 
             learned_k      = k;
             learned_stride = stride;
@@ -148,18 +151,12 @@ static void drain(int fd, int n_frames) {
             }
             try_reconstruct(base, n_frames);
         }
-    }
 }
 
 int main(void) {
-    const char *t0_env  = getenv("T0");
-    const char *dly_env = getenv("DELAY_MS");
     const char *dur_env = getenv("DURATION_S");
-
-    double g_t0       = t0_env  ? atof(t0_env)  : now_s();
-    double g_delay_ms = dly_env ? atof(dly_env) : 100.0;
-    double dur        = dur_env ? atof(dur_env) : 30.0;
-    int    n_frames   = (int)(dur * 1000.0 / FRAME_MS) + 64;
+    double dur      = dur_env ? atof(dur_env) : 30.0;
+    int    n_frames = (int)(dur * 1000.0 / FRAME_MS) + 64;
     if (n_frames > MAX_FRAMES) n_frames = MAX_FRAMES;
 
     int in_fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -171,53 +168,18 @@ int main(void) {
         perror("bind 47002"); return 1;
     }
 
-    int out_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in player = {0};
-    player.sin_family      = AF_INET;
-    player.sin_port        = htons(47020);
-    player.sin_addr.s_addr = inet_addr("127.0.0.1");
+    g_out_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    memset(&g_player, 0, sizeof g_player);
+    g_player.sin_family      = AF_INET;
+    g_player.sin_port        = htons(47020);
+    g_player.sin_addr.s_addr = inet_addr("127.0.0.1");
 
-    int next_play = 0;
-
+    /* No playout clock: forward on arrival. The harness kills us at run end. */
+    uint8_t pkt[2048];
     for (;;) {
-        if (next_play >= n_frames) break;
-
-        /* Harness deadline: t0 + delay_ms + i*20ms.
-         * We aim to send SEND_EARLY_MS before that so loopback + jitter
-         * never push us past the deadline. */
-        double send_at = g_t0 + g_delay_ms / 1000.0
-                       + next_play * FRAME_MS / 1000.0
-                       - SEND_EARLY_MS / 1000.0;
-
-        /* Sleep until send_at, reading any arriving packets along the way. */
-        double wait;
-        while ((wait = send_at - now_s()) > 0.0) {
-            /* Non-blocking drain first — pick up any already-queued packets. */
-            drain(in_fd, n_frames);
-
-            /* Recheck in case draining took time. */
-            wait = send_at - now_s();
-            if (wait <= 0.0) break;
-
-            /* Block until a packet arrives OR the deadline arrives. */
-            struct timeval tv;
-            tv.tv_sec  = (long)wait;
-            tv.tv_usec = (long)((wait - (long)wait) * 1e6);
-            if (tv.tv_usec < 0) tv.tv_usec = 0;
-
-            fd_set fds; FD_ZERO(&fds); FD_SET(in_fd, &fds);
-            select(in_fd + 1, &fds, NULL, NULL, &tv);
-            /* Whether packet arrived or timeout fired, drain in next iteration */
-        }
-
-        /* Final drain to catch any last-instant arrivals. */
-        drain(in_fd, n_frames);
-
-        if (slots[next_play].present) {
-            sendto(out_fd, slots[next_play].data, FRAME_LEN, 0,
-                   (struct sockaddr *)&player, sizeof player);
-        }
-        next_play++;
+        ssize_t n = recvfrom(in_fd, pkt, sizeof pkt, 0, NULL, NULL);
+        if (n <= 0) continue;
+        handle(pkt, n, n_frames);
     }
     return 0;
 }
